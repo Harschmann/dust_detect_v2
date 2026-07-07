@@ -1,0 +1,8 @@
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+customtkinter>=5.2
+
+# Basler SDK - needs the Basler Pylon runtime installed on the machine.
+# Without it the app still runs (webcam / synthetic fallback).
+pypylon>=3.0
