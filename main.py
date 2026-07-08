@@ -1,42 +1,43 @@
 """
 main.py
 --------
-Camera-module dust & string inspector - clean rebuild.
+Camera-module dust & string inspector - lightweight build.
 
 Run:
     python main.py
 
-Pick a camera from the dropdown (Basler, any USB/UVC webcam, or the
-synthetic feed if none are connected) -> click the live view to mark
-each lens centre -> tune radius -> save the config under a phone-model
-name -> Capture & Inspect runs the simple Z-score white-dust/string
-detector and files the result as NG/OK.
+Pick a camera (Basler / any webcam / synthetic) -> click the live view
+to mark each lens centre -> tune radius -> save under a phone-model name
+-> Capture & Inspect runs the simple Z-score white-dust/string detector
+and files the result as NG/OK.
 
-Dark "stealth" UI with a slow moving-gradient background.
+Performance notes:
+  * The live view is shown DOWNSCALED (big industrial frames are 20MP;
+    pushing every full-res frame through the UI 30x/sec is what made it
+    hang). ROIs are still kept in full-resolution coordinates and the
+    actual inspection always runs on the full-res frame - only the
+    on-screen preview is scaled down.
+  * No animated backgrounds - plain dark UI, minimal redraw work.
 """
-
-import os
-import threading
-from datetime import datetime
 
 import cv2
 import customtkinter as ctk
 from tkinter import messagebox
+from datetime import datetime
+import threading
 
 from camera import CameraManager, enumerate_cameras
 from detector import inspect, DEFAULT_PARAMS
 from storage import Storage
 from canvas_widget import ViewState, ImageCanvas
-from gradient import FlowGradient
 
 ctk.set_appearance_mode("dark")
 
-# ---- stealth palette (near-black, cool accent)
-BG = "#0b0c10"
-PANEL = "#111318"
-PANEL2 = "#0e1015"
+# minimal dark palette
+BG = "#0e0f12"
+PANEL = "#16181d"
+PANEL2 = "#101216"
 ACCENT = "#4fd0e0"
-ACCENT_DIM = "#2b8f9c"
 NG = "#ff5468"
 OK = "#37e29a"
 MUTED = "#6b7280"
@@ -45,24 +46,29 @@ TEXT = "#e6e8ec"
 ROI_COLOR = (150, 150, 158)     # BGR unselected
 ROI_SEL = (0, 210, 255)         # BGR selected
 
+MAX_PREVIEW = 1500              # longest side (px) of the on-screen live preview
+
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("Dust Inspector")
-        self.geometry("1440x900")
-        self.minsize(1180, 720)
+        self.geometry("1360x860")
+        self.minsize(1100, 700)
         self.configure(fg_color=BG)
 
         self.storage = Storage()
         self.camera = CameraManager()
-        self.cameras = []              # enumerated descriptors
-        self._cam_labels = {}          # label -> descriptor
+        self.cameras = []
+        self._cam_labels = {}
+        self._pending_cams = None
 
-        self.rois = []
+        self.rois = []                 # full-resolution coords: {cx,cy,r}
         self.selected_idx = None
         self.roi_rows = []
         self._param_widgets = {}
+        self._disp_scale = 1.0         # preview downscale factor (<=1)
+        self._frame_hw = (0, 0)        # full-res frame size
         self._res_autoset_done = False
         self._last_result = None
 
@@ -76,13 +82,11 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<space>", self._on_space)
 
-        # connect to the best available camera on startup, then populate list
-        self._pending_cams = None       # set by worker thread, consumed in _tick
         threading.Thread(target=self._startup_cameras, daemon=True).start()
         self._refresh_models()
         self._tick()
 
-    # ================================================================ params
+    # ---------------------------------------------------------- params
     def params(self):
         return {
             "sigma": float(self.sigma.get()),
@@ -99,78 +103,66 @@ class App(ctk.CTk):
         for lbl, fmt, var in self._param_widgets.values():
             lbl.configure(text=fmt(var.get()))
 
-    # ==================================================================== UI
+    # =============================================================== UI
     def _build_ui(self):
-        # ambient animated gradient behind everything
-        self.bg = FlowGradient(self, speed=0.8, downscale=12)
-        self.bg.place(x=0, y=0, relwidth=1, relheight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
+        self.grid_rowconfigure(1, weight=1)
 
-        # content sits on top with a small margin so the gradient glows at edges
-        content = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        content.place(relx=0.5, rely=0.5, anchor="center", relwidth=0.992, relheight=0.988)
-        content.grid_columnconfigure(0, weight=1)
-        content.grid_columnconfigure(1, weight=0)
-        content.grid_rowconfigure(1, weight=1)
+        # --- top bar (static, minimal)
+        top = ctk.CTkFrame(self, height=54, corner_radius=0, fg_color=PANEL)
+        top.grid(row=0, column=0, columnspan=2, sticky="ew")
+        top.grid_propagate(False)
+        ctk.CTkLabel(top, text="  \u25C9  Dust Inspector",
+                     font=ctk.CTkFont(size=17, weight="bold"), text_color=TEXT
+                     ).pack(side="left", padx=12, pady=10)
+        self.status = ctk.CTkLabel(top, text="", text_color=MUTED, font=ctk.CTkFont(size=12))
+        self.status.pack(side="left", padx=8)
 
-        self._build_header(content)
+        cam_box = ctk.CTkFrame(top, fg_color="transparent")
+        cam_box.pack(side="right", padx=10)
+        ctk.CTkLabel(cam_box, text="Camera", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
+        self.cam_combo = ctk.CTkComboBox(cam_box, width=290, values=["Scanning..."],
+                                         command=self._on_camera_pick, fg_color=PANEL2,
+                                         button_color="#2b8f9c", border_color="#242a34",
+                                         dropdown_fg_color=PANEL)
+        self.cam_combo.pack(side="left", padx=4)
+        ctk.CTkButton(cam_box, text="\u21BB", width=36, fg_color=PANEL2, hover_color="#1b1f27",
+                      command=self._rescan_cameras).pack(side="left")
 
-        # ---- live view (left)
-        view_wrap = ctk.CTkFrame(content, fg_color=BG, corner_radius=0)
-        view_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(8, 0))
-        view_wrap.grid_rowconfigure(0, weight=1)
-        view_wrap.grid_columnconfigure(0, weight=1)
-
+        # --- live view (left)
+        view = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        view.grid(row=1, column=0, sticky="nsew", padx=(10, 6), pady=(8, 0))
+        view.grid_rowconfigure(0, weight=1)
+        view.grid_columnconfigure(0, weight=1)
         self.view = ViewState()
-        self.canvas = ImageCanvas(view_wrap, view_state=self.view, editable=True,
-                                  bg="#050608",
-                                  on_click=self._on_click,
-                                  on_radius_change=self._nudge_radius,
+        self.canvas = ImageCanvas(view, view_state=self.view, editable=True, bg="#050608",
+                                  on_click=self._on_click, on_radius_change=self._nudge_radius,
                                   on_delete=self._delete_selected)
         self.canvas.grid(row=0, column=0, sticky="nsew")
 
-        bar = ctk.CTkFrame(view_wrap, fg_color="transparent")
+        bar = ctk.CTkFrame(view, fg_color="transparent")
         bar.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ctk.CTkButton(bar, text="\u2212", width=34, fg_color=PANEL, hover_color="#1b1f27",
                       command=lambda: self._zoom(1 / 1.2)).pack(side="left", padx=3)
-        ctk.CTkButton(bar, text="\u2922 Fit", width=60, fg_color=PANEL, hover_color="#1b1f27",
+        ctk.CTkButton(bar, text="\u2922 Fit", width=58, fg_color=PANEL, hover_color="#1b1f27",
                       command=self.canvas.fit_to_window).pack(side="left", padx=3)
         ctk.CTkButton(bar, text="+", width=34, fg_color=PANEL, hover_color="#1b1f27",
                       command=lambda: self._zoom(1.2)).pack(side="left", padx=3)
-        ctk.CTkLabel(bar, text="click = add / select ROI   \u2022   drag = pan   \u2022   "
-                              "scroll = zoom   \u2022   shift+scroll = radius   \u2022   "
-                              "del = remove   \u2022   space = inspect",
-                     text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=14)
+        ctk.CTkLabel(bar, text="click = ROI  \u2022  drag = pan  \u2022  scroll = zoom  \u2022  "
+                              "shift+scroll = radius  \u2022  del = remove  \u2022  space = inspect",
+                     text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=12)
 
-        # ---- sidebar (right)
-        side = ctk.CTkScrollableFrame(content, width=346, fg_color=PANEL, corner_radius=14,
+        # --- sidebar (right)
+        side = ctk.CTkScrollableFrame(self, width=330, fg_color=PANEL, corner_radius=0,
                                       scrollbar_button_color="#2a2f3a")
         side.grid(row=1, column=1, sticky="ns", pady=(8, 0))
         self._build_sidebar(side)
 
-    def _build_header(self, parent):
-        header = FlowGradient(parent, speed=1.1, downscale=8, height=66,
-                              colors=[(12, 16, 28), (30, 26, 66), (16, 40, 60),
-                                      (40, 22, 58), (10, 12, 20)])
-        header.grid(row=0, column=0, columnspan=2, sticky="ew")
-        header.grid_propagate(False)
-        # overlay title + camera controls on the gradient using place
-        ctk.CTkLabel(header, text="  \u25C9  DUST INSPECTOR",
-                     font=ctk.CTkFont(size=19, weight="bold"), text_color=TEXT,
-                     fg_color="transparent").place(x=6, rely=0.5, anchor="w")
-
-        right = ctk.CTkFrame(header, fg_color="transparent")
-        right.place(relx=1.0, rely=0.5, anchor="e", x=-8)
-        self.cam_combo = ctk.CTkComboBox(right, width=280, values=["Scanning cameras..."],
-                                         command=self._on_camera_pick,
-                                         fg_color=PANEL2, button_color=ACCENT_DIM,
-                                         border_color=ACCENT_DIM, dropdown_fg_color=PANEL)
-        self.cam_combo.pack(side="left", padx=6)
-        ctk.CTkButton(right, text="\u21BB", width=38, fg_color=PANEL2, hover_color="#1b1f27",
-                      command=self._rescan_cameras).pack(side="left")
-
     def _section(self, parent, title):
         ctk.CTkLabel(parent, text=title.upper(), font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color=ACCENT).pack(anchor="w", padx=8, pady=(18, 6))
+                     text_color=ACCENT).pack(anchor="w", padx=8, pady=(16, 6))
 
     def _slider(self, parent, key, title, var, lo, hi, fmt, steps=None):
         ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=11), text_color=TEXT
@@ -187,9 +179,9 @@ class App(ctk.CTk):
     def _build_sidebar(self, p):
         self._section(p, "Phone model")
         self.model_combo = ctk.CTkComboBox(p, values=[], variable=self.current_model,
-                                           command=lambda _c: self._load_model(),
-                                           fg_color=PANEL2, button_color=ACCENT_DIM,
-                                           border_color="#242a34", dropdown_fg_color=PANEL)
+                                           command=lambda _c: self._load_model(), fg_color=PANEL2,
+                                           button_color="#2b8f9c", border_color="#242a34",
+                                           dropdown_fg_color=PANEL)
         self.model_combo.pack(fill="x", padx=8)
         row = ctk.CTkFrame(p, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=6)
@@ -205,10 +197,10 @@ class App(ctk.CTk):
         self._section(p, "ROI points")
         self.roi_frame = ctk.CTkFrame(p, fg_color="transparent")
         self.roi_frame.pack(fill="x", padx=8)
-        self.radius = ctk.CTkSlider(p, from_=5, to=600, progress_color=ACCENT,
+        self.radius = ctk.CTkSlider(p, from_=10, to=1400, progress_color=ACCENT,
                                     button_color=ACCENT, button_hover_color=TEXT,
                                     command=self._radius_slider)
-        self.radius.set(50)
+        self.radius.set(120)
         self.radius.pack(fill="x", padx=8, pady=(10, 0))
         self.radius_note = ctk.CTkLabel(p, text="select an ROI to edit its radius",
                                         text_color=MUTED, font=ctk.CTkFont(size=11))
@@ -228,7 +220,7 @@ class App(ctk.CTk):
                       progress_color=ACCENT).pack(anchor="w")
 
         self._section(p, "Inspect")
-        ctk.CTkButton(p, text="\U0001F50D   CAPTURE & INSPECT", height=48, fg_color=ACCENT,
+        ctk.CTkButton(p, text="\U0001F50D   CAPTURE & INSPECT", height=46, fg_color=ACCENT,
                       text_color="#04252b", hover_color=TEXT,
                       font=ctk.CTkFont(size=14, weight="bold"),
                       command=self._capture).pack(fill="x", padx=8, pady=4)
@@ -240,39 +232,32 @@ class App(ctk.CTk):
 
         self._section(p, "Recent")
         self.log = ctk.CTkFrame(p, fg_color="transparent")
-        self.log.pack(fill="x", padx=8, pady=(0, 18))
+        self.log.pack(fill="x", padx=8, pady=(0, 16))
         self.log_rows = []
 
-    # ============================================================== cameras
+    # ============================================================ cameras
     def _startup_cameras(self):
-        cams = self.camera.connect_best_available()
-        self._pending_cams = cams
+        self._pending_cams = self.camera.connect_best_available()
 
     def _rescan_cameras(self):
-        self.cam_combo.configure(values=["Scanning cameras..."])
-        self.cam_combo.set("Scanning cameras...")
-        threading.Thread(target=self._do_rescan, daemon=True).start()
-
-    def _do_rescan(self):
-        self._pending_cams = enumerate_cameras()
+        self.cam_combo.configure(values=["Scanning..."])
+        self.cam_combo.set("Scanning...")
+        threading.Thread(target=lambda: setattr(self, "_pending_cams", enumerate_cameras()),
+                         daemon=True).start()
 
     def _populate_cameras(self, cams):
         self.cameras = cams
-        labels = [c["name"] for c in cams] + ["Synthetic feed (no camera)"]
         self._cam_labels = {c["name"]: c for c in cams}
-        self.cam_combo.configure(values=labels)
-        # reflect whatever is currently connected
-        if self.camera.active:
-            self.cam_combo.set(self.camera.active["name"])
-        else:
-            self.cam_combo.set("Synthetic feed (no camera)")
+        self.cam_combo.configure(values=[c["name"] for c in cams] + ["Synthetic feed (no camera)"])
+        self.cam_combo.set(self.camera.active["name"] if self.camera.active
+                           else "Synthetic feed (no camera)")
 
     def _on_camera_pick(self, label):
-        desc = self._cam_labels.get(label)  # None => synthetic
+        desc = self._cam_labels.get(label)
         self.cam_combo.set(label if label else "Synthetic feed (no camera)")
         threading.Thread(target=lambda: self.camera.connect(desc), daemon=True).start()
 
-    # =============================================================== models
+    # ============================================================= models
     def _refresh_models(self):
         self.model_combo.configure(values=self.storage.list_models())
 
@@ -281,10 +266,8 @@ class App(ctk.CTk):
         if not model:
             return
         cfg = self.storage.load_config(model)
-        if cfg is None:
-            self.rois = []
-        else:
-            self.rois = cfg.get("rois", [])
+        self.rois = cfg.get("rois", []) if cfg else []
+        if cfg:
             self._apply_params(cfg.get("params", {}))
         self.selected_idx = None
         self._rebuild_roi_list()
@@ -316,21 +299,23 @@ class App(ctk.CTk):
         self._rebuild_roi_list()
 
     # ============================================================ ROI edit
+    # NOTE: canvas coords are in DISPLAY (downscaled) space; ROIs are stored
+    # in FULL-RES space. Convert at the boundary with self._disp_scale.
     def _on_click(self, nx, ny, cx, cy):
         hit = self._hit(cx, cy)
         if hit is not None:
             self.selected_idx = hit
         else:
-            img = self.canvas.source_image
-            base = min(img.shape[1], img.shape[0]) if img is not None else 960
-            self.rois.append({"cx": nx, "cy": ny, "r": max(20, int(base * 0.04))})
+            fx, fy = nx / self._disp_scale, ny / self._disp_scale
+            base = min(self._frame_hw) if min(self._frame_hw) > 0 else 960
+            self.rois.append({"cx": fx, "cy": fy, "r": max(20, int(base * 0.04))})
             self.selected_idx = len(self.rois) - 1
         self._rebuild_roi_list()
 
     def _hit(self, cx, cy, tol=14):
         best, bd = None, tol
         for i, r in enumerate(self.rois):
-            rx, ry = self.view.to_canvas(r["cx"], r["cy"])
+            rx, ry = self.view.to_canvas(r["cx"] * self._disp_scale, r["cy"] * self._disp_scale)
             d = ((rx - cx) ** 2 + (ry - cy) ** 2) ** 0.5
             if d < bd:
                 best, bd = i, d
@@ -339,7 +324,8 @@ class App(ctk.CTk):
     def _nudge_radius(self, delta):
         if self.selected_idx is None or self.selected_idx >= len(self.rois):
             return
-        self.rois[self.selected_idx]["r"] = max(4, self.rois[self.selected_idx]["r"] + delta)
+        # delta is in display px; convert to full-res
+        self.rois[self.selected_idx]["r"] = max(4, self.rois[self.selected_idx]["r"] + delta / self._disp_scale)
         self._rebuild_roi_list()
 
     def _radius_slider(self, value):
@@ -379,18 +365,18 @@ class App(ctk.CTk):
                          text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", pady=2)
         for i, r in enumerate(self.rois):
             sel = i == self.selected_idx
-            row = ctk.CTkFrame(self.roi_frame, fg_color=("#132a30" if sel else "transparent"))
-            row.pack(fill="x", pady=1)
-            btn = ctk.CTkButton(row, text=f"#{i + 1}    r = {int(r['r'])}px", anchor="w",
+            rowf = ctk.CTkFrame(self.roi_frame, fg_color=("#132a30" if sel else "transparent"))
+            rowf.pack(fill="x", pady=1)
+            btn = ctk.CTkButton(rowf, text=f"#{i + 1}    r = {int(r['r'])}px", anchor="w",
                                 fg_color="transparent", text_color=(ACCENT if sel else TEXT),
                                 hover_color="#1b1f27", command=lambda idx=i: self._select(idx))
             btn.pack(side="left", expand=True, fill="x")
             self.roi_rows.append(btn)
-            ctk.CTkButton(row, text="\u2715", width=28, fg_color="transparent",
+            ctk.CTkButton(rowf, text="\u2715", width=28, fg_color="transparent",
                           hover_color="#6a2833", command=lambda idx=i: self._delete_at(idx)
                           ).pack(side="right")
         if self.selected_idx is not None and self.selected_idx < len(self.rois):
-            self.radius.set(self.rois[self.selected_idx]["r"])
+            self.radius.set(min(self.rois[self.selected_idx]["r"], 1400))
             self.radius_note.configure(
                 text=f"ROI #{self.selected_idx + 1}  radius {int(self.rois[self.selected_idx]['r'])}px")
         else:
@@ -415,7 +401,7 @@ class App(ctk.CTk):
         if not self.rois:
             messagebox.showwarning("No ROI", "Kam se kam ek ROI lagao (live view pe click karke).")
             return
-        frame = self.camera.get_frame()
+        frame = self.camera.get_frame()          # FULL resolution
         if frame is None:
             messagebox.showwarning("No frame", "Camera se frame nahi mila.")
             return
@@ -452,40 +438,54 @@ class App(ctk.CTk):
             self.log_rows.pop().destroy()
 
     # ============================================================ render
-    def _autoset_min_area(self, frame):
+    def _autoset_min_area(self, h, w):
         if self._res_autoset_done:
             return
         self._res_autoset_done = True
         if self.current_model.get().strip():
             return
-        scale = max(frame.shape[0], frame.shape[1]) / 1280.0
+        scale = max(h, w) / 1280.0
         if scale <= 1.2:
             return
         self.min_area.set(int(round(DEFAULT_PARAMS["min_area"] * scale * scale)))
         for lbl, fmt, var in self._param_widgets.values():
             lbl.configure(text=fmt(var.get()))
-        self.save_note.configure(text=f"\u2699 {max(frame.shape[:2])}px camera - min size set "
-                                      f"to {int(self.min_area.get())}px")
+        self.save_note.configure(text=f"\u2699 {max(h, w)}px camera - min size set to "
+                                      f"{int(self.min_area.get())}px")
         self.after(5000, lambda: self.save_note.configure(text=""))
 
     def _tick(self):
         if self._pending_cams is not None:
-            cams = self._pending_cams
-            self._pending_cams = None
+            cams, self._pending_cams = self._pending_cams, None
             self._populate_cameras(cams)
+
         frame = self.camera.get_frame()
         if frame is not None:
-            self._autoset_min_area(frame)
-            disp = frame.copy()
+            h, w = frame.shape[:2]
+            self._frame_hw = (h, w)
+            self._autoset_min_area(h, w)
+
+            # downscale for display (the key fix for the 20MP feed hang)
+            scale = min(1.0, MAX_PREVIEW / max(h, w))
+            self._disp_scale = scale
+            if scale < 1.0:
+                disp = cv2.resize(frame, (max(int(w * scale), 1), max(int(h * scale), 1)),
+                                  interpolation=cv2.INTER_LINEAR)
+            else:
+                disp = frame.copy()
+
             for i, r in enumerate(self.rois):
                 color = ROI_SEL if i == self.selected_idx else ROI_COLOR
-                c = (int(r["cx"]), int(r["cy"]))
-                cv2.circle(disp, c, int(r["r"]), color, 2)
+                c = (int(r["cx"] * scale), int(r["cy"] * scale))
+                cv2.circle(disp, c, max(int(r["r"] * scale), 1), color, 2)
                 cv2.drawMarker(disp, c, color, cv2.MARKER_CROSS, 10, 1)
-                cv2.putText(disp, str(i + 1), (c[0] - 6, c[1] - int(r["r"]) - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+                cv2.putText(disp, str(i + 1), (c[0] - 6, c[1] - max(int(r["r"] * scale), 1) - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
             self.canvas.set_image(disp)
-        self.after(33, self._tick)
+            self.status.configure(text=self.camera.status_text())
+
+        self.after(40, self._tick)      # ~25 fps preview
 
     def _on_close(self):
         self.camera.stop()
@@ -499,7 +499,7 @@ class ResultWindow(ctk.CTkToplevel):
         self.saved = saved
         self.model = model
         self.title(f"Result - {model} test{saved['index']}")
-        self.geometry("1080x660")
+        self.geometry("1060x650")
         self.configure(fg_color=BG)
 
         col = NG if res.verdict == "NG" else OK
@@ -520,12 +520,13 @@ class ResultWindow(ctk.CTkToplevel):
         ctk.CTkLabel(body, text="Inspected  (dust = red, string = amber)", text_color=MUTED,
                      font=ctk.CTkFont(size=12)).grid(row=0, column=1, sticky="w")
         shared = ViewState()
+        # downscale the review images too so huge frames render fast
         left = ImageCanvas(body, view_state=shared, editable=False, bg="#050608")
         left.grid(row=1, column=0, sticky="nsew", padx=(0, 5))
         right = ImageCanvas(body, view_state=shared, editable=False, bg="#050608")
         right.grid(row=1, column=1, sticky="nsew", padx=(5, 0))
-        left.set_image(original)
-        right.set_image(res.annotated, fit_if_first=False)
+        left.set_image(self._fit(original))
+        right.set_image(self._fit(res.annotated), fit_if_first=False)
 
         ctk.CTkLabel(self, text=f"saved: {saved['after_path']}", text_color=MUTED,
                      font=ctk.CTkFont(size=11)).pack(pady=(0, 6))
@@ -537,6 +538,14 @@ class ResultWindow(ctk.CTkToplevel):
         ctk.CTkButton(btns, text=f"\u2717  Galat - flip to {other}", width=200,
                       fg_color="#4a3a16", hover_color="#6a5320", command=self._flip
                       ).pack(side="left", padx=6)
+
+    @staticmethod
+    def _fit(img, longest=1500):
+        h, w = img.shape[:2]
+        s = min(1.0, longest / max(h, w))
+        if s < 1.0:
+            return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        return img
 
     def _flip(self):
         old = self.saved["verdict"]
