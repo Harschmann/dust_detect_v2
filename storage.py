@@ -98,4 +98,3 @@ class Storage:
         ng, ok = count("NG"), count("OK")
         total = ng + ok
         return {"ng": ng, "ok": ok, "total": total, "ng_rate": (ng / total * 100) if total else 0.0}
-
