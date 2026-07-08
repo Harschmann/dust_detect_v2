@@ -2,6 +2,7 @@
 detector.py
 ------------
 The simple, original approach: per-ROI Z-score anomaly detection.
+ok
 
 For each circular ROI (a camera lens/module) the pixels inside are one
 population. A pixel that is brighter than the population mean by more
