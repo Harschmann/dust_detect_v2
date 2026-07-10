@@ -50,8 +50,8 @@ DUST_COLOR = (0, 0, 255)      # red (BGR) - the only defect colour now
 
 DEFAULT_PARAMS = dict(
     sigma=3.5,                # brightness Z-score threshold
-    window_px=0,              # 0 = auto (scales with ROI radius); or set an absolute px value to tune manually
-    white_only=True,          # ignore coloured pixels
+    window_px=31,             # local mean/std window (px) - matches the validated external tool's default
+    white_only=False,         # OFF by default - the exact core has no colour gating; turn on only if needed
     white_max_saturation=60,  # HSV S above this = "coloured", not a defect
     dark_floor=0,             # gray below this is ignored (0 = off)
     blur_ksize=3,             # pre-blur to calm sensor noise (odd)
@@ -61,8 +61,8 @@ DEFAULT_PARAMS = dict(
     min_pixels=10,            # hard noise floor, always applied
     size_bias_px=0.0,         # subtracted from every measured span
     max_defect_fraction=0.5,  # reject any blob spanning more than this fraction of the ROI diameter (structural, not a defect)
-    reject_rings=True,        # reject any blob shaped like a ring/donut (has a hole) - coating structure, not a defect
-    max_elongation=2.2,       # reject anything more elongated than this (threads, arcs) - only compact round dust survives
+    reject_rings=False,       # optional: reject ring/donut-shaped blobs (has a hole) - off by default
+    max_elongation=0,         # optional: reject anything more elongated than this - 0 = off (no shape rejection)
 )
 
 
@@ -105,80 +105,48 @@ def _max_feret_px(pts):
     return float(np.sqrt(d2.max())) + 1.0
 
 
-def _local_mean(values_f32, mask_bool, win):
-    """Local neighbourhood average via boxFilter, masked to eligible
-    pixels. A broad, slowly-varying feature (a coating ring) is absorbed
-    as background since the local mean tracks its level."""
-    mask_f = mask_bool.astype(np.float32)
-    den = cv2.boxFilter(mask_f, -1, (win, win), normalize=False)
-    den = np.maximum(den, 1e-6)
-    num = cv2.boxFilter(values_f32 * mask_f, -1, (win, win), normalize=False)
-    return num / den
-
-
-def _robust_scale(residual_2d, mask_bool):
-    """A single GLOBAL robust scale (median/MAD) for the whole detrended
-    residual population. Using a local (per-pixel) std here instead can
-    backfire when a broad feature's own width is comparable to the
-    window: the feature's internal gradient then inflates local std
-    right on top of it, burying real anomalies in the same area. A
-    global scale doesn't have that failure mode - after a reasonable
-    local-mean detrend, the residual is near-zero almost everywhere
-    (including across the ring), so one robust scale for the whole
-    population stays small and a real local spike still stands out."""
-    vals = residual_2d[mask_bool]
-    med = float(np.median(vals))
-    mad = float(np.median(np.abs(vals - med)))
-    std = 1.4826 * mad
-    if std < 1.0:
-        std = max(float(np.std(vals)), 1.0)
-    return med, std
+def _zscore_exact(gray_f32, win):
+    """Exactly the formula validated externally: local mean and local
+    mean-of-squares via plain boxFilter (no masking), local_std from the
+    E[X^2]-E[X]^2 identity, one-sided Z-score. Deliberately no colour/
+    dark exclusion baked in here - that stays a fully separate, optional
+    post-filter so it can never change what this core computation sees."""
+    local_mean = cv2.boxFilter(gray_f32, -1, (win, win))
+    local_mean_sq = cv2.boxFilter(gray_f32 * gray_f32, -1, (win, win))
+    local_std = np.sqrt(np.maximum(local_mean_sq - local_mean * local_mean, 0))
+    z = np.where(local_std > 1e-5, (gray_f32 - local_mean) / local_std, 0.0)
+    return z
 
 
 def _bright_mask(gray_c, sat_c, inside, radius, p):
-    """The actual candidate-defect mask for one ROI. Order matters:
-    1) build the white-eligible mask FIRST - unconditionally black out
-       coloured/dark pixels, before any statistics are touched.
-    2) compute local mean/std and Z-score using ONLY the white-eligible
-       pixels, so a bright/large coloured patch (AR coating) can never
-       influence what counts as 'bright' nearby - it's simply excluded
-       from the population, not just from the final answer.
+    """The candidate-defect mask for one ROI: the exact Z-score core
+    above, restricted to the ROI circle, with a small set of OPTIONAL
+    post-filters (each default off unless turned on) layered after -
+    never mixed into the core statistics itself.
     Shared by both real detection and the mask preview, so the preview
     can never show something different from what actually gets detected.
     """
-    win = int(p.get("window_px", 0))
-    if win <= 0:
-        # auto: big enough that any real defect is a small minority of the
-        # window's population (so it can't drag its own local mean/std up),
-        # but still local enough to absorb a broad ring as background.
-        win = max(101, int(round(radius * 0.4)))
+    win = int(p.get("window_px", 31)) or 31
     if win % 2 == 0:
         win += 1
 
-    white_ok = inside.copy()
-    if p["white_only"] and sat_c is not None:
-        white_ok &= (sat_c <= p["white_max_saturation"])
-    if p.get("dark_floor", 0) > 0:
-        white_ok &= (gray_c >= float(p["dark_floor"]))
-
-    if int(np.count_nonzero(white_ok)) < 50:
-        return np.zeros(gray_c.shape, dtype=np.uint8), win
-
     gray_f = gray_c.astype(np.float32)
-    local_mean = _local_mean(gray_f, white_ok, win)
-    residual = gray_f - local_mean
-    med, local_std = _robust_scale(residual, white_ok)
-    z = (residual - med) / local_std
-    bright = (z > p["sigma"]) & white_ok
+    z = _zscore_exact(gray_f, win)
+    bright = (z >= p["sigma"]) & inside
+
+    if p.get("white_only", False) and sat_c is not None:
+        bright &= (sat_c <= p["white_max_saturation"])
+    if p.get("dark_floor", 0) > 0:
+        bright &= (gray_c >= float(p["dark_floor"]))
 
     bright_u8 = bright.astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bright_u8 = cv2.morphologyEx(bright_u8, cv2.MORPH_CLOSE, k)
 
-    # RING REJECTION: a ring/donut shape (the coating's concentric ring)
-    # has a HOLE in it - topologically an annulus. A real particle is a
-    # solid blob with no hole. This is independent of colour/brightness.
-    if p.get("reject_rings", True):
+    # RING REJECTION (optional, default off): a ring/donut shape has a
+    # HOLE in it - topologically an annulus. A real particle is a solid
+    # blob with no hole.
+    if p.get("reject_rings", False):
         contours, hierarchy = cv2.findContours(bright_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         if hierarchy is not None and len(contours) > 0:
             hierarchy = hierarchy[0]
@@ -251,21 +219,13 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     bright_u8, win = _bright_mask(gray_c, sat_c, inside, radius, p)
 
     # Sizing mask, measured on the UNBLURRED image (blur inflates small
-    # particles by ~2px). Same white-eligibility-first order as detection.
-    white_ok = inside.copy()
-    if p["white_only"] and sat_c is not None:
-        white_ok &= (sat_c <= p["white_max_saturation"])
+    # particles by ~2px). Same exact-formula core, same optional filters.
+    z_raw = _zscore_exact(gray_raw_c.astype(np.float32), win)
+    sharp = (z_raw >= p["sigma"]) & inside
+    if p.get("white_only", False) and sat_c is not None:
+        sharp &= (sat_c <= p["white_max_saturation"])
     if p.get("dark_floor", 0) > 0:
-        white_ok &= (gray_raw_c >= float(p["dark_floor"]))
-    if int(np.count_nonzero(white_ok)) >= 50:
-        gray_raw_f = gray_raw_c.astype(np.float32)
-        lm_raw = _local_mean(gray_raw_f, white_ok, win)
-        res_raw = gray_raw_f - lm_raw
-        med_raw, std_raw = _robust_scale(res_raw, white_ok)
-        z_raw = (res_raw - med_raw) / std_raw
-        sharp = (z_raw > p["sigma"]) & white_ok
-    else:
-        sharp = np.zeros_like(inside)
+        sharp &= (gray_raw_c >= float(p["dark_floor"]))
 
     mm_per_px = float(p["mm_per_px"])
     calibrated = mm_per_px > 0
@@ -293,15 +253,14 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
         if feret_px > max_feret_allowed:
             continue
 
-        # SHAPE REJECTION: keep only compact, roughly-round blobs (real
-        # dust). Anything elongated - a thread, but also a curved
-        # lighting arc or coating-structure line - is rejected outright
-        # rather than classified. A random arc getting mistaken for a
-        # "thread" was a real false positive; simply not treating
-        # elongated shapes as defects at all removes that failure mode.
+        # SHAPE REJECTION (optional, off by default): keep only compact,
+        # roughly-round blobs. A thread, or a curved lighting arc / coating
+        # structure line, is elongated - if this is turned on, anything
+        # more elongated than max_elongation is rejected outright.
         (_, (rw, rh), _) = cv2.minAreaRect(m_pts)
         elongation = max(rw, rh) / max(min(rw, rh), 1.0)
-        if elongation > p.get("max_elongation", 2.2):
+        max_elong = p.get("max_elongation", 0)
+        if max_elong and elongation > max_elong:
             continue
 
         feret_mm = feret_px * mm_per_px if calibrated else None
