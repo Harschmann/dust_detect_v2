@@ -131,21 +131,33 @@ def _local_detrend(values_f32, mask_bool, win):
 
 
 def _bright_mask(gray_c, sat_c, inside, radius, p):
-    """The actual candidate-defect mask for one ROI: local-detrended,
-    one-sided Z-score, white-only gate, ring/donut rejection. Shared by
-    both real detection and the mask preview, so the preview can never
-    show something different from what actually gets detected."""
+    """The actual candidate-defect mask for one ROI. Order matters:
+    1) build the white-eligible mask FIRST - unconditionally black out
+       coloured/dark pixels, before any statistics are touched.
+    2) compute the local background and Z-score using ONLY the
+       white-eligible pixels, so a bright/large coloured patch (AR
+       coating) can never influence what counts as 'bright' nearby -
+       it's simply excluded from the population, not just from the
+       final answer.
+    Shared by both real detection and the mask preview, so the preview
+    can never show something different from what actually gets detected.
+    """
     win = max(31, int(round(radius * 0.5)))
     if win % 2 == 0:
         win += 1
-    detrended = _local_detrend(gray_c.astype(np.float32), inside, win)
-    z = _robust_z(detrended, inside)
-    bright = (z > p["sigma"]) & inside
 
+    white_ok = inside.copy()
     if p["white_only"] and sat_c is not None:
-        bright &= (sat_c <= p["white_max_saturation"])
+        white_ok &= (sat_c <= p["white_max_saturation"])
     if p.get("dark_floor", 0) > 0:
-        bright &= (gray_c >= float(p["dark_floor"]))
+        white_ok &= (gray_c >= float(p["dark_floor"]))
+
+    if int(np.count_nonzero(white_ok)) < 50:
+        return np.zeros(gray_c.shape, dtype=np.uint8), win
+
+    detrended = _local_detrend(gray_c.astype(np.float32), white_ok, win)
+    z = _robust_z(detrended, white_ok)
+    bright = (z > p["sigma"]) & white_ok
 
     bright_u8 = bright.astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -227,12 +239,18 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     bright_u8, win = _bright_mask(gray_c, sat_c, inside, radius, p)
 
     # Sizing mask, measured on the UNBLURRED image (blur inflates small
-    # particles by ~2px). Same local-detrend logic as detection.
-    detrended_raw = _local_detrend(gray_raw_c.astype(np.float32), inside, win)
-    z_raw = _robust_z(detrended_raw, inside)
-    sharp = (z_raw > p["sigma"]) & inside
+    # particles by ~2px). Same white-eligibility-first order as detection.
+    white_ok = inside.copy()
     if p["white_only"] and sat_c is not None:
-        sharp &= (sat_c <= p["white_max_saturation"])
+        white_ok &= (sat_c <= p["white_max_saturation"])
+    if p.get("dark_floor", 0) > 0:
+        white_ok &= (gray_raw_c >= float(p["dark_floor"]))
+    if int(np.count_nonzero(white_ok)) >= 50:
+        detrended_raw = _local_detrend(gray_raw_c.astype(np.float32), white_ok, win)
+        z_raw = _robust_z(detrended_raw, white_ok)
+        sharp = (z_raw > p["sigma"]) & white_ok
+    else:
+        sharp = np.zeros_like(inside)
 
     mm_per_px = float(p["mm_per_px"])
     calibrated = mm_per_px > 0
