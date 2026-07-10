@@ -53,6 +53,7 @@ DEFAULT_PARAMS = dict(
     mm_per_px=0.0,            # 0 = uncalibrated (pixel mode)
     min_pixels=10,            # hard noise floor, always applied (uncalibrated mode only - see note)
     size_bias_px=0.0,         # subtracted from every measured span; see note below
+    max_defect_fraction=0.5,  # reject any blob spanning more than this fraction of the ROI diameter (structural, not a defect)
 )
 
 # MEASUREMENT ACCURACY
@@ -118,8 +119,9 @@ def _max_feret_px(pts):
 def white_mask_preview(frame, rois, params=None):
     """Returns a BGR image showing what the colour/dark mask keeps: inside
     each ROI, coloured and dark pixels are blacked out and only white-
-    eligible pixels keep their brightness. Lets the operator SEE that
-    blue coating etc. is masked before it ever reaches detection."""
+    eligible pixels keep their brightness. Uses the exact same plain
+    per-pixel cutoff as real detection, so this preview is always
+    trustworthy - nothing here can differ from what gets detected."""
     p = dict(DEFAULT_PARAMS)
     if params:
         p.update({k: v for k, v in params.items() if v is not None})
@@ -135,9 +137,7 @@ def white_mask_preview(frame, rois, params=None):
         r_an = max(roi["r"] - p["edge_margin_px"], 4)
         m = _circular_mask((h, w), roi["cx"], roi["cy"], r_an) > 0
         if p["white_only"] and sat is not None:
-            weak_thresh = max(8, p["white_max_saturation"] * 0.4)
-            colored = _grow_colored_region(sat, p["white_max_saturation"], weak_thresh)
-            m &= ~colored
+            m &= (sat <= p["white_max_saturation"])
         if p.get("dark_floor", 0) > 0:
             m &= (gray >= float(p["dark_floor"]))
         keep |= m
@@ -147,39 +147,11 @@ def white_mask_preview(frame, rois, params=None):
     return out
 
 
-def _grow_colored_region(sat, strong_thresh, weak_thresh, max_iters=80):
-    """Reconstruction by dilation: a soft coloured reflection has a bright,
-    gradually-desaturating halo whose width isn't known in advance (it
-    depends on how diffuse that particular reflection is). Instead of
-    guessing a fixed dilation radius, grow the confidently-coloured seed
-    (S > strong_thresh) outward, but only through pixels that are still
-    at least weakly coloured (S > weak_thresh). This follows the halo's
-    actual shape and extent exactly, whatever they are, and stops as soon
-    as it reaches genuinely neutral (white/gray) pixels."""
-    strong = (sat > strong_thresh)
-    weak = (sat > weak_thresh)
-    region = strong & weak
-    if not region.any():
-        return strong
-    k = np.ones((3, 3), np.uint8)
-    for _ in range(max_iters):
-        grown = cv2.dilate(region.astype(np.uint8), k) > 0
-        grown &= weak
-        if np.array_equal(grown, region):
-            break
-        region = grown
-    return region
-
-
 def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     H, W = gray.shape
 
     # Crop to a local window around this ROI (with a small margin) before
-    # any per-pixel work. Every operation below - colour reconstruction,
-    # Z-score, morphology - is local to one lens; running it on the full
-    # 20MP frame for every ROI is 100-1000x more work than necessary and
-    # is what made this slow. Blob coordinates are mapped back to full-
-    # frame space at the end.
+    # any per-pixel work - keeps this fast on 20MP frames.
     pad = 8
     x0 = max(0, int(cx - radius - pad)); x1 = min(W, int(cx + radius + pad) + 1)
     y0 = max(0, int(cy - radius - pad)); y1 = min(H, int(cy + radius + pad) + 1)
@@ -194,37 +166,30 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
 
     mask = _circular_mask((h, w), cx_c, cy_c, radius)
     inside = mask > 0
-
-    # --- STEP 1: white-eligibility mask (the "mask non-white to black" idea)
-    # A real defect (dust / thread / glue) is white/gray = LOW saturation
-    # and not dark. Everything else - coloured AR-coating reflections,
-    # dark coating texture - is blacked out here so it can neither be
-    # detected NOR pollute the Z-score statistics below.
-    white_ok = inside.copy()
-    if p["white_only"] and sat_c is not None:
-        # weak threshold: half the strong threshold (or a small absolute
-        # floor), catches the desaturating halo without also swallowing
-        # ordinary sensor noise's tiny saturation fluctuations.
-        weak_thresh = max(8, p["white_max_saturation"] * 0.4)
-        colored = _grow_colored_region(sat_c, p["white_max_saturation"], weak_thresh)
-        white_ok &= ~colored
-    # optional darkness floor: ignore anything well below the surface level
-    if p.get("dark_floor", 0) > 0:
-        white_ok &= (gray_raw_c >= float(p["dark_floor"]))
-
-    elig = gray_c[white_ok]
-    if elig.size < 50:
+    pix = gray_c[inside]
+    if pix.size < 50:
         return []
 
-    # --- STEP 2: Z-score over the WHITE-ELIGIBLE population only, so a big
-    # coloured patch or dark region can't drag the mean around.
-    mean = float(np.mean(elig))
-    std = float(np.std(elig))
+    # Statistics over the FULL ROI population, never gated by colour -
+    # a previous version computed mean/std only over "white-eligible"
+    # pixels, which could collapse to almost nothing on a real coating
+    # with broad colour variation and silently return zero detections.
+    # Keeping this simple and ungated is what makes it robust.
+    mean = float(np.mean(pix))
+    std = float(np.std(pix))
     if std < 1e-6:
         return []
 
     z = (gray_c.astype(np.float32) - mean) / std
-    bright = (z > p["sigma"]) & white_ok            # isolated bright + white only
+    bright = (z > p["sigma"]) & inside              # one-sided: brighter than surroundings
+
+    # White-only: a real defect (dust/thread/glue) is white/gray = LOW
+    # saturation. A plain per-pixel cutoff - no growing, no reconstruction,
+    # nothing that can spread across a whole coating and eat everything.
+    if p["white_only"] and sat_c is not None:
+        bright &= (sat_c <= p["white_max_saturation"])
+    if p.get("dark_floor", 0) > 0:
+        bright &= (gray_raw_c >= float(p["dark_floor"]))
 
     bright_u8 = bright.astype(np.uint8) * 255
 
@@ -234,17 +199,20 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     bright_u8 = cv2.morphologyEx(bright_u8, cv2.MORPH_CLOSE, k)
 
     # Sizing mask, measured on the UNBLURRED image (blur inflates small
-    # particles by ~2px). Same white-eligibility and statistics.
-    raw_mean = float(np.mean(gray_raw_c[white_ok]))
-    raw_std = float(np.std(gray_raw_c[white_ok]))
+    # particles by ~2px).
+    raw_mean = float(np.mean(gray_raw_c[inside]))
+    raw_std = float(np.std(gray_raw_c[inside]))
     if raw_std > 1e-6:
         z_raw = (gray_raw_c.astype(np.float32) - raw_mean) / raw_std
-        sharp = (z_raw > p["sigma"]) & white_ok
+        sharp = (z_raw > p["sigma"]) & inside
+        if p["white_only"] and sat_c is not None:
+            sharp &= (sat_c <= p["white_max_saturation"])
     else:
         sharp = bright
 
     mm_per_px = float(p["mm_per_px"])
     calibrated = mm_per_px > 0
+    max_feret_allowed = 2.0 * radius * float(p.get("max_defect_fraction", 0.5))
 
     n, labels, stats, _ = cv2.connectedComponentsWithStats(bright_u8, connectivity=8)
     blobs = []
@@ -265,6 +233,17 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
         m_pts = np.column_stack([mxs, mys]).astype(np.int32)
 
         feret_px = max(_max_feret_px(m_pts) - float(p["size_bias_px"]), 0.1)
+
+        # MAX-SIZE GATE: a real defect is always much smaller than the
+        # lens it sits on. Anything spanning a large fraction of the ROI
+        # itself - a broad ring from the coating's own construction, a
+        # big shadow, a lighting gradient - is a structural/background
+        # feature, not contamination, and is rejected here regardless of
+        # brightness or colour. This is what guarantees the concentric
+        # ring around the lens centre can never be called a defect.
+        if feret_px > max_feret_allowed:
+            continue
+
         feret_mm = feret_px * mm_per_px if calibrated else None
         area_mm2 = m_area * (mm_per_px ** 2) if calibrated else None
 
