@@ -206,7 +206,7 @@ class App(ctk.CTk):
         self.review_wrap.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(self.review_wrap, text="ORIGINAL", text_color=MUTED,
                      font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w", pady=(0, 3))
-        ctk.CTkLabel(self.review_wrap, text="INSPECTED   \u2022  dust = red   \u2022  string = amber",
+        ctk.CTkLabel(self.review_wrap, text="INSPECTED   \u2022  defects circled in red",
                      text_color=MUTED, font=ctk.CTkFont(size=10, weight="bold")
                      ).grid(row=0, column=1, sticky="w", pady=(0, 3))
         self.rev_view = ViewState()
@@ -721,11 +721,11 @@ class App(ctk.CTk):
         order = sorted(res.defects, key=lambda b: b["feret_px"], reverse=True)
         for i, b in enumerate(order[:14]):
             dot = "\u25CF"
-            col = "#ff5566" if b["cls"] == "dust" else "#ffb03a"
+            col = "#ff5566"
             if res.calibrated:
-                txt = f"{dot} {b['cls']:6s} {b['feret_mm']:.3f} mm   {b['area_mm2']:.4f} mm\u00B2"
+                txt = f"{dot} {b['feret_mm']:.3f} mm   {b['area_mm2']:.4f} mm\u00B2"
             else:
-                txt = f"{dot} {b['cls']:6s} {b['feret_px']:.0f} px   {b['area_px']:.0f} px\u00B2"
+                txt = f"{dot} {b['feret_px']:.0f} px   {b['area_px']:.0f} px\u00B2"
             ctk.CTkLabel(self.defects_box, text=txt, text_color=col, anchor="w",
                          font=ctk.CTkFont(family="Courier", size=10)).pack(anchor="w")
         if len(order) > 14:
