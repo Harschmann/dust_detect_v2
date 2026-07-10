@@ -50,6 +50,7 @@ DUST_COLOR = (0, 0, 255)      # red (BGR) - the only defect colour now
 
 DEFAULT_PARAMS = dict(
     sigma=3.5,                # brightness Z-score threshold
+    window_px=0,              # 0 = auto (scales with ROI radius); or set an absolute px value to tune manually
     white_only=True,          # ignore coloured pixels
     white_max_saturation=60,  # HSV S above this = "coloured", not a defect
     dark_floor=0,             # gray below this is ignored (0 = off)
@@ -104,45 +105,53 @@ def _max_feret_px(pts):
     return float(np.sqrt(d2.max())) + 1.0
 
 
-def _robust_z(values_2d, mask_bool):
-    """Median/MAD Z-score map, computed only from pixels where mask_bool
-    is True. Robust to a large anomalous region skewing the statistics
-    (unlike plain mean/std)."""
-    vals = values_2d[mask_bool]
+def _local_mean(values_f32, mask_bool, win):
+    """Local neighbourhood average via boxFilter, masked to eligible
+    pixels. A broad, slowly-varying feature (a coating ring) is absorbed
+    as background since the local mean tracks its level."""
+    mask_f = mask_bool.astype(np.float32)
+    den = cv2.boxFilter(mask_f, -1, (win, win), normalize=False)
+    den = np.maximum(den, 1e-6)
+    num = cv2.boxFilter(values_f32 * mask_f, -1, (win, win), normalize=False)
+    return num / den
+
+
+def _robust_scale(residual_2d, mask_bool):
+    """A single GLOBAL robust scale (median/MAD) for the whole detrended
+    residual population. Using a local (per-pixel) std here instead can
+    backfire when a broad feature's own width is comparable to the
+    window: the feature's internal gradient then inflates local std
+    right on top of it, burying real anomalies in the same area. A
+    global scale doesn't have that failure mode - after a reasonable
+    local-mean detrend, the residual is near-zero almost everywhere
+    (including across the ring), so one robust scale for the whole
+    population stays small and a real local spike still stands out."""
+    vals = residual_2d[mask_bool]
     med = float(np.median(vals))
     mad = float(np.median(np.abs(vals - med)))
     std = 1.4826 * mad
     if std < 1.0:
         std = max(float(np.std(vals)), 1.0)
-    return (values_2d - med) / std
-
-
-def _local_detrend(values_f32, mask_bool, win):
-    """Subtract each pixel's own local neighbourhood average (boxFilter).
-    A broad, slowly-varying feature (a coating ring) is absorbed as
-    background since the local mean tracks it; a small isolated bright
-    speck stands out against its own immediate surroundings regardless
-    of how much of the ROI the broad feature covers."""
-    mask_f = mask_bool.astype(np.float32)
-    num = cv2.boxFilter(values_f32 * mask_f, -1, (win, win), normalize=False)
-    den = cv2.boxFilter(mask_f, -1, (win, win), normalize=False)
-    local_mean = num / np.maximum(den, 1e-6)
-    return values_f32 - local_mean
+    return med, std
 
 
 def _bright_mask(gray_c, sat_c, inside, radius, p):
     """The actual candidate-defect mask for one ROI. Order matters:
     1) build the white-eligible mask FIRST - unconditionally black out
        coloured/dark pixels, before any statistics are touched.
-    2) compute the local background and Z-score using ONLY the
-       white-eligible pixels, so a bright/large coloured patch (AR
-       coating) can never influence what counts as 'bright' nearby -
-       it's simply excluded from the population, not just from the
-       final answer.
+    2) compute local mean/std and Z-score using ONLY the white-eligible
+       pixels, so a bright/large coloured patch (AR coating) can never
+       influence what counts as 'bright' nearby - it's simply excluded
+       from the population, not just from the final answer.
     Shared by both real detection and the mask preview, so the preview
     can never show something different from what actually gets detected.
     """
-    win = max(31, int(round(radius * 0.5)))
+    win = int(p.get("window_px", 0))
+    if win <= 0:
+        # auto: big enough that any real defect is a small minority of the
+        # window's population (so it can't drag its own local mean/std up),
+        # but still local enough to absorb a broad ring as background.
+        win = max(101, int(round(radius * 0.4)))
     if win % 2 == 0:
         win += 1
 
@@ -155,8 +164,11 @@ def _bright_mask(gray_c, sat_c, inside, radius, p):
     if int(np.count_nonzero(white_ok)) < 50:
         return np.zeros(gray_c.shape, dtype=np.uint8), win
 
-    detrended = _local_detrend(gray_c.astype(np.float32), white_ok, win)
-    z = _robust_z(detrended, white_ok)
+    gray_f = gray_c.astype(np.float32)
+    local_mean = _local_mean(gray_f, white_ok, win)
+    residual = gray_f - local_mean
+    med, local_std = _robust_scale(residual, white_ok)
+    z = (residual - med) / local_std
     bright = (z > p["sigma"]) & white_ok
 
     bright_u8 = bright.astype(np.uint8) * 255
@@ -246,8 +258,11 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     if p.get("dark_floor", 0) > 0:
         white_ok &= (gray_raw_c >= float(p["dark_floor"]))
     if int(np.count_nonzero(white_ok)) >= 50:
-        detrended_raw = _local_detrend(gray_raw_c.astype(np.float32), white_ok, win)
-        z_raw = _robust_z(detrended_raw, white_ok)
+        gray_raw_f = gray_raw_c.astype(np.float32)
+        lm_raw = _local_mean(gray_raw_f, white_ok, win)
+        res_raw = gray_raw_f - lm_raw
+        med_raw, std_raw = _robust_scale(res_raw, white_ok)
+        z_raw = (res_raw - med_raw) / std_raw
         sharp = (z_raw > p["sigma"]) & white_ok
     else:
         sharp = np.zeros_like(inside)
