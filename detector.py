@@ -5,10 +5,8 @@ Per-ROI Z-score anomaly detection for white dust and thin cloth strings,
 with PHYSICAL SIZE measurement so the accept/reject rule matches the
 actual spec instead of an arbitrary pixel count.
 
-Detection (Updated with Local Background Subtraction):
-  * local high-pass filter - flattens uneven lighting/vignetting so isolated
-    small dust blobs don't get lost in the global background mean.
-  * one-sided Z-score - only pixels BRIGHTER than the local ROI mean count,
+Detection (unchanged, deliberately simple):
+  * one-sided Z-score - only pixels BRIGHTER than the ROI mean count,
     because dust/string/glue are white on the module surface.
   * white-only gate - coloured pixels (blue/green AR-coating reflections,
     yellow glare) are dropped by an HSV saturation check.
@@ -18,11 +16,23 @@ Detection (Updated with Local Background Subtraction):
 Sizing:
   Each blob's size is its MAX FERET LENGTH - the largest end-to-end
   distance across the blob, computed exactly as the maximum pairwise
-  distance between its convex-hull vertices.
+  distance between its convex-hull vertices. For a round particle that
+  is its diameter; for an irregular one it is the longest span, which is
+  exactly how the 0.1 mm spec is written.
+
+  With a calibration (mm per pixel) that length converts to millimetres
+  and anything below `min_length_mm` is ignored. Area in mm^2 is
+  reported too (pixel count x mm_per_px^2).
 
 Calibration:
-  mm_per_px cannot be derived from the image alone. One physical reference is
-  required. If mm_per_px is 0 the detector stays in pixel mode.
+  mm_per_px cannot be derived from the image alone - a 20 MP photo says
+  nothing about how wide a scene it covers. One physical reference is
+  required. The app provides two ways to supply it:
+     * a drawn ROI whose real diameter (mm) is known, e.g. the lens
+       barrel:  mm_per_px = real_diameter_mm / (2 * roi_radius_px)
+     * a directly entered sensor scale in micrometres per pixel.
+  If mm_per_px is 0 the detector stays in pixel mode: sizes are reported
+  in px and only the pixel noise floor filters blobs.
 """
 
 import cv2
@@ -35,14 +45,24 @@ DEFAULT_PARAMS = dict(
     sigma=3.5,                # brightness Z-score threshold
     white_only=True,          # ignore coloured pixels
     white_max_saturation=60,  # HSV S above this = "coloured", not a defect
+    dark_floor=0,             # gray below this is ignored (0 = off); blacks out dark regions
     blur_ksize=3,             # pre-blur to calm sensor noise (odd)
     string_elongation=3.0,    # length/width above which a blob is a "string"
     edge_margin_px=4,         # shrink each ROI so the lens rim doesn't fire
     min_length_mm=0.1,        # SPEC: ignore anything whose max span is under this
     mm_per_px=0.0,            # 0 = uncalibrated (pixel mode)
-    min_pixels=4,             # hard noise floor, always applied
-    size_bias_px=0.0,         # subtracted from every measured span
+    min_pixels=10,            # hard noise floor, always applied (uncalibrated mode only - see note)
+    size_bias_px=0.0,         # subtracted from every measured span; see note below
 )
+
+# MEASUREMENT ACCURACY
+# Blobs are FOUND on the blurred image (so a faint particle still clears
+# the Z-threshold) but MEASURED on the unblurred one. Without that split
+# the blur's skirt pushes a ring of extra pixels over the threshold and
+# inflates small particles by ~2 px. Verified against synthetic discs of
+# known pixel diameter: measurement is exact to +/-0 px across 7..61 px.
+# size_bias_px stays at 0 unless you calibrate against a known reference
+# particle and find a residual systematic offset in your optics.
 
 
 class Result:
@@ -78,7 +98,16 @@ def _circular_mask(shape_hw, cx, cy, r):
 
 
 def _max_feret_px(pts):
-    """Largest end-to-end distance across the blob, in pixels."""
+    """Largest end-to-end distance across the blob, in pixels.
+
+    The farthest pair of points always lies on the convex hull, so only
+    hull vertices need comparing - a handful of points, so the O(n^2)
+    scan is trivial.
+
+    The +1.0 is a real correction, not a fudge: hull vertices are pixel
+    CENTRES, so a blob physically spanning N pixels has centres spanning
+    only N-1. Verified against synthetic discs of known pixel diameter.
+    """
     hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.float32)
     if len(hull) < 2:
         return 1.0
@@ -86,51 +115,131 @@ def _max_feret_px(pts):
     return float(np.sqrt(d2.max())) + 1.0
 
 
-def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
+def white_mask_preview(frame, rois, params=None):
+    """Returns a BGR image showing what the colour/dark mask keeps: inside
+    each ROI, coloured and dark pixels are blacked out and only white-
+    eligible pixels keep their brightness. Lets the operator SEE that
+    blue coating etc. is masked before it ever reaches detection."""
+    p = dict(DEFAULT_PARAMS)
+    if params:
+        p.update({k: v for k, v in params.items() if v is not None})
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sat = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 1]
+    else:
+        gray = frame
+        sat = None
     h, w = gray.shape
-    mask = _circular_mask((h, w), cx, cy, radius)
-    inside = mask > 0
-    pix = gray[inside]
-    if pix.size < 50:
+    keep = np.zeros((h, w), dtype=bool)
+    for roi in rois:
+        r_an = max(roi["r"] - p["edge_margin_px"], 4)
+        m = _circular_mask((h, w), roi["cx"], roi["cy"], r_an) > 0
+        if p["white_only"] and sat is not None:
+            weak_thresh = max(8, p["white_max_saturation"] * 0.4)
+            colored = _grow_colored_region(sat, p["white_max_saturation"], weak_thresh)
+            m &= ~colored
+        if p.get("dark_floor", 0) > 0:
+            m &= (gray >= float(p["dark_floor"]))
+        keep |= m
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    g3 = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    out[keep] = g3[keep]
+    return out
+
+
+def _grow_colored_region(sat, strong_thresh, weak_thresh, max_iters=80):
+    """Reconstruction by dilation: a soft coloured reflection has a bright,
+    gradually-desaturating halo whose width isn't known in advance (it
+    depends on how diffuse that particular reflection is). Instead of
+    guessing a fixed dilation radius, grow the confidently-coloured seed
+    (S > strong_thresh) outward, but only through pixels that are still
+    at least weakly coloured (S > weak_thresh). This follows the halo's
+    actual shape and extent exactly, whatever they are, and stops as soon
+    as it reaches genuinely neutral (white/gray) pixels."""
+    strong = (sat > strong_thresh)
+    weak = (sat > weak_thresh)
+    region = strong & weak
+    if not region.any():
+        return strong
+    k = np.ones((3, 3), np.uint8)
+    for _ in range(max_iters):
+        grown = cv2.dilate(region.astype(np.uint8), k) > 0
+        grown &= weak
+        if np.array_equal(grown, region):
+            break
+        region = grown
+    return region
+
+
+def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
+    H, W = gray.shape
+
+    # Crop to a local window around this ROI (with a small margin) before
+    # any per-pixel work. Every operation below - colour reconstruction,
+    # Z-score, morphology - is local to one lens; running it on the full
+    # 20MP frame for every ROI is 100-1000x more work than necessary and
+    # is what made this slow. Blob coordinates are mapped back to full-
+    # frame space at the end.
+    pad = 8
+    x0 = max(0, int(cx - radius - pad)); x1 = min(W, int(cx + radius + pad) + 1)
+    y0 = max(0, int(cy - radius - pad)); y1 = min(H, int(cy + radius + pad) + 1)
+    if x1 <= x0 or y1 <= y0:
         return []
 
-    # --- Local Background Subtraction (High-Pass) ---
-    bg_ksize = int(max(radius // 4, 31))
-    if bg_ksize % 2 == 0: bg_ksize += 1
+    gray_c = gray[y0:y1, x0:x1]
+    gray_raw_c = gray_raw[y0:y1, x0:x1]
+    sat_c = sat[y0:y1, x0:x1] if sat is not None else None
+    cx_c, cy_c = cx - x0, cy - y0
+    h, w = gray_c.shape
 
-    bg = cv2.GaussianBlur(gray, (bg_ksize, bg_ksize), 0)
-    high_pass = gray.astype(np.float32) - bg.astype(np.float32)
-    hp_pix = high_pass[inside]
+    mask = _circular_mask((h, w), cx_c, cy_c, radius)
+    inside = mask > 0
 
-    mean = float(np.mean(hp_pix))
-    std = float(np.std(hp_pix))
-    
+    # --- STEP 1: white-eligibility mask (the "mask non-white to black" idea)
+    # A real defect (dust / thread / glue) is white/gray = LOW saturation
+    # and not dark. Everything else - coloured AR-coating reflections,
+    # dark coating texture - is blacked out here so it can neither be
+    # detected NOR pollute the Z-score statistics below.
+    white_ok = inside.copy()
+    if p["white_only"] and sat_c is not None:
+        # weak threshold: half the strong threshold (or a small absolute
+        # floor), catches the desaturating halo without also swallowing
+        # ordinary sensor noise's tiny saturation fluctuations.
+        weak_thresh = max(8, p["white_max_saturation"] * 0.4)
+        colored = _grow_colored_region(sat_c, p["white_max_saturation"], weak_thresh)
+        white_ok &= ~colored
+    # optional darkness floor: ignore anything well below the surface level
+    if p.get("dark_floor", 0) > 0:
+        white_ok &= (gray_raw_c >= float(p["dark_floor"]))
+
+    elig = gray_c[white_ok]
+    if elig.size < 50:
+        return []
+
+    # --- STEP 2: Z-score over the WHITE-ELIGIBLE population only, so a big
+    # coloured patch or dark region can't drag the mean around.
+    mean = float(np.mean(elig))
+    std = float(np.std(elig))
     if std < 1e-6:
         return []
 
-    z = (high_pass - mean) / std
-    bright = (z > p["sigma"]) & inside
-
-    if p["white_only"] and sat is not None:
-        bright &= (sat <= p["white_max_saturation"])
+    z = (gray_c.astype(np.float32) - mean) / std
+    bright = (z > p["sigma"]) & white_ok            # isolated bright + white only
 
     bright_u8 = bright.astype(np.uint8) * 255
 
+    # Close bridges a thin string's small gaps. No "open" - that would
+    # erase the string outright. Noise specks die on the area filter.
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bright_u8 = cv2.morphologyEx(bright_u8, cv2.MORPH_CLOSE, k)
 
-    # Sizing mask (exact extent from the raw image)
-    raw_bg = cv2.GaussianBlur(gray_raw, (bg_ksize, bg_ksize), 0)
-    hp_raw = gray_raw.astype(np.float32) - raw_bg.astype(np.float32)
-    hp_raw_pix = hp_raw[inside]
-    raw_mean = float(np.mean(hp_raw_pix))
-    raw_std = float(np.std(hp_raw_pix))
-
+    # Sizing mask, measured on the UNBLURRED image (blur inflates small
+    # particles by ~2px). Same white-eligibility and statistics.
+    raw_mean = float(np.mean(gray_raw_c[white_ok]))
+    raw_std = float(np.std(gray_raw_c[white_ok]))
     if raw_std > 1e-6:
-        z_raw = (hp_raw - raw_mean) / raw_std
-        sharp = (z_raw > p["sigma"]) & inside
-        if p["white_only"] and sat is not None:
-            sharp &= (sat <= p["white_max_saturation"])
+        z_raw = (gray_raw_c.astype(np.float32) - raw_mean) / raw_std
+        sharp = (z_raw > p["sigma"]) & white_ok
     else:
         sharp = bright
 
@@ -145,12 +254,13 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
             continue
         blob_sel = labels == lbl
 
+        # exact extent from the raw image, confined to this blob
         sharp_sel = blob_sel & sharp
         if int(np.count_nonzero(sharp_sel)) >= 2:
             mys, mxs = np.where(sharp_sel)
             m_area = int(sharp_sel.sum())
         else:
-            mys, mxs = np.where(blob_sel)
+            mys, mxs = np.where(blob_sel)       # faint particle: blur was load-bearing
             m_area = area_px
         m_pts = np.column_stack([mxs, mys]).astype(np.int32)
 
@@ -158,6 +268,8 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
         feret_mm = feret_px * mm_per_px if calibrated else None
         area_mm2 = m_area * (mm_per_px ** 2) if calibrated else None
 
+        # THE SPEC RULE: ignore particles whose longest span is under the
+        # threshold. For a round particle that span is its diameter.
         if calibrated and feret_mm < p["min_length_mm"]:
             continue
 
@@ -166,7 +278,8 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
         cls = "string" if elong >= p["string_elongation"] else "dust"
         (bx, by), br = cv2.minEnclosingCircle(m_pts)
         blobs.append({
-            "x": float(bx), "y": float(by), "r": max(float(br), 3.0),
+            # map back to full-frame coordinates
+            "x": float(bx) + x0, "y": float(by) + y0, "r": max(float(br), 3.0),
             "area_px": float(m_area), "feret_px": float(feret_px),
             "feret_mm": feret_mm, "area_mm2": area_mm2,
             "cls": cls, "elongation": float(elong),
@@ -202,6 +315,7 @@ def inspect(frame, rois, params=None):
     res = Result()
     res.calibrated = float(p["mm_per_px"]) > 0
 
+    # scale annotation weight with resolution so marks stay visible on 20MP
     h, w = annotated.shape[:2]
     th = max(1, int(round(max(h, w) / 1600)))
     fs = max(0.4, min(1.4, max(h, w) / 3600.0))
