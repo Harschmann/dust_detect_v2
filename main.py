@@ -86,6 +86,7 @@ class App(ctk.CTk):
         self.sigma = ctk.DoubleVar(value=DEFAULT_PARAMS["sigma"])
         self.min_length_mm = ctk.DoubleVar(value=DEFAULT_PARAMS["min_length_mm"])
         self.mm_per_px = ctk.DoubleVar(value=DEFAULT_PARAMS["mm_per_px"])
+        self.window_px = ctk.IntVar(value=DEFAULT_PARAMS["window_px"])
         self.white_only = ctk.BooleanVar(value=DEFAULT_PARAMS["white_only"])
         self.white_sat = ctk.IntVar(value=DEFAULT_PARAMS["white_max_saturation"])
         self.dark_floor = ctk.IntVar(value=DEFAULT_PARAMS["dark_floor"])
@@ -112,6 +113,7 @@ class App(ctk.CTk):
             "dark_floor": int(self.dark_floor.get()),
             "blur_ksize": int(self.blur_ksize.get()),
             "min_pixels": int(self.min_pixels.get()),
+            "window_px": int(self.window_px.get()),
         }
 
     def _apply_params(self, p):
@@ -123,6 +125,7 @@ class App(ctk.CTk):
         self.dark_floor.set(int(p.get("dark_floor", DEFAULT_PARAMS["dark_floor"])))
         self.blur_ksize.set(int(p.get("blur_ksize", DEFAULT_PARAMS["blur_ksize"])))
         self.min_pixels.set(int(p.get("min_pixels", DEFAULT_PARAMS["min_pixels"])))
+        self.window_px.set(int(p.get("window_px", DEFAULT_PARAMS["window_px"])))
         self._update_calib_chip()
 
     # ============================================================== UI
@@ -973,6 +976,8 @@ class SettingsWindow(ctk.CTkToplevel):
                      app.dark_floor, 0, 150, lambda v: str(int(v)))
         self._slider(wrap, "Noise floor (px)   used when uncalibrated",
                      app.min_pixels, 1, 400, lambda v: str(int(v)))
+        self._slider(wrap, "Analysis window (px)   0 = auto-scaled to ROI",
+                     app.window_px, 0, 400, lambda v: str(int(v)))
         sw = ctk.CTkFrame(wrap, fg_color="transparent")
         sw.pack(fill="x", padx=10, pady=(8, 0))
         ctk.CTkSwitch(sw, text="White defects only (ignore colour)", variable=app.white_only,
