@@ -5,8 +5,10 @@ Per-ROI Z-score anomaly detection for white dust and thin cloth strings,
 with PHYSICAL SIZE measurement so the accept/reject rule matches the
 actual spec instead of an arbitrary pixel count.
 
-Detection (unchanged, deliberately simple):
-  * one-sided Z-score - only pixels BRIGHTER than the ROI mean count,
+Detection (Updated with Local Background Subtraction):
+  * local high-pass filter - flattens uneven lighting/vignetting so isolated
+    small dust blobs don't get lost in the global background mean.
+  * one-sided Z-score - only pixels BRIGHTER than the local ROI mean count,
     because dust/string/glue are white on the module surface.
   * white-only gate - coloured pixels (blue/green AR-coating reflections,
     yellow glare) are dropped by an HSV saturation check.
@@ -16,23 +18,11 @@ Detection (unchanged, deliberately simple):
 Sizing:
   Each blob's size is its MAX FERET LENGTH - the largest end-to-end
   distance across the blob, computed exactly as the maximum pairwise
-  distance between its convex-hull vertices. For a round particle that
-  is its diameter; for an irregular one it is the longest span, which is
-  exactly how the 0.1 mm spec is written.
-
-  With a calibration (mm per pixel) that length converts to millimetres
-  and anything below `min_length_mm` is ignored. Area in mm^2 is
-  reported too (pixel count x mm_per_px^2).
+  distance between its convex-hull vertices.
 
 Calibration:
-  mm_per_px cannot be derived from the image alone - a 20 MP photo says
-  nothing about how wide a scene it covers. One physical reference is
-  required. The app provides two ways to supply it:
-     * a drawn ROI whose real diameter (mm) is known, e.g. the lens
-       barrel:  mm_per_px = real_diameter_mm / (2 * roi_radius_px)
-     * a directly entered sensor scale in micrometres per pixel.
-  If mm_per_px is 0 the detector stays in pixel mode: sizes are reported
-  in px and only the pixel noise floor filters blobs.
+  mm_per_px cannot be derived from the image alone. One physical reference is
+  required. If mm_per_px is 0 the detector stays in pixel mode.
 """
 
 import cv2
@@ -51,17 +41,8 @@ DEFAULT_PARAMS = dict(
     min_length_mm=0.1,        # SPEC: ignore anything whose max span is under this
     mm_per_px=0.0,            # 0 = uncalibrated (pixel mode)
     min_pixels=4,             # hard noise floor, always applied
-    size_bias_px=0.0,         # subtracted from every measured span; see note below
+    size_bias_px=0.0,         # subtracted from every measured span
 )
-
-# MEASUREMENT ACCURACY
-# Blobs are FOUND on the blurred image (so a faint particle still clears
-# the Z-threshold) but MEASURED on the unblurred one. Without that split
-# the blur's skirt pushes a ring of extra pixels over the threshold and
-# inflates small particles by ~2 px. Verified against synthetic discs of
-# known pixel diameter: measurement is exact to +/-0 px across 7..61 px.
-# size_bias_px stays at 0 unless you calibrate against a known reference
-# particle and find a residual systematic offset in your optics.
 
 
 class Result:
@@ -97,16 +78,7 @@ def _circular_mask(shape_hw, cx, cy, r):
 
 
 def _max_feret_px(pts):
-    """Largest end-to-end distance across the blob, in pixels.
-
-    The farthest pair of points always lies on the convex hull, so only
-    hull vertices need comparing - a handful of points, so the O(n^2)
-    scan is trivial.
-
-    The +1.0 is a real correction, not a fudge: hull vertices are pixel
-    CENTRES, so a blob physically spanning N pixels has centres spanning
-    only N-1. Verified against synthetic discs of known pixel diameter.
-    """
+    """Largest end-to-end distance across the blob, in pixels."""
     hull = cv2.convexHull(pts).reshape(-1, 2).astype(np.float32)
     if len(hull) < 2:
         return 1.0
@@ -122,34 +94,40 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     if pix.size < 50:
         return []
 
-    mean = float(np.mean(pix))
-    std = float(np.std(pix))
+    # --- Local Background Subtraction (High-Pass) ---
+    bg_ksize = int(max(radius // 4, 31))
+    if bg_ksize % 2 == 0: bg_ksize += 1
+
+    bg = cv2.GaussianBlur(gray, (bg_ksize, bg_ksize), 0)
+    high_pass = gray.astype(np.float32) - bg.astype(np.float32)
+    hp_pix = high_pass[inside]
+
+    mean = float(np.mean(hp_pix))
+    std = float(np.std(hp_pix))
+    
     if std < 1e-6:
         return []
 
-    z = (gray.astype(np.float32) - mean) / std
-    bright = (z > p["sigma"]) & inside              # one-sided: white/bright only
+    z = (high_pass - mean) / std
+    bright = (z > p["sigma"]) & inside
 
     if p["white_only"] and sat is not None:
         bright &= (sat <= p["white_max_saturation"])
 
     bright_u8 = bright.astype(np.uint8) * 255
 
-    # Close bridges a thin string's small gaps. No "open" - that would
-    # erase the string outright. Noise specks die on the area filter.
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bright_u8 = cv2.morphologyEx(bright_u8, cv2.MORPH_CLOSE, k)
 
-    # Sizing mask, measured on the UNBLURRED image. Detection uses the
-    # blurred image (a faint particle needs the blur's help to clear the
-    # threshold), but the blur's skirt pushes a ring of extra pixels over
-    # it too, inflating small particles by ~2px. Re-thresholding the raw
-    # image inside each found blob gives the true extent - detection stays
-    # robust, measurement stays exact.
-    raw_mean = float(np.mean(gray_raw[inside]))
-    raw_std = float(np.std(gray_raw[inside]))
+    # Sizing mask (exact extent from the raw image)
+    raw_bg = cv2.GaussianBlur(gray_raw, (bg_ksize, bg_ksize), 0)
+    hp_raw = gray_raw.astype(np.float32) - raw_bg.astype(np.float32)
+    hp_raw_pix = hp_raw[inside]
+    raw_mean = float(np.mean(hp_raw_pix))
+    raw_std = float(np.std(hp_raw_pix))
+
     if raw_std > 1e-6:
-        z_raw = (gray_raw.astype(np.float32) - raw_mean) / raw_std
+        z_raw = (hp_raw - raw_mean) / raw_std
         sharp = (z_raw > p["sigma"]) & inside
         if p["white_only"] and sat is not None:
             sharp &= (sat <= p["white_max_saturation"])
@@ -167,13 +145,12 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
             continue
         blob_sel = labels == lbl
 
-        # exact extent from the raw image, confined to this blob
         sharp_sel = blob_sel & sharp
         if int(np.count_nonzero(sharp_sel)) >= 2:
             mys, mxs = np.where(sharp_sel)
             m_area = int(sharp_sel.sum())
         else:
-            mys, mxs = np.where(blob_sel)       # faint particle: blur was load-bearing
+            mys, mxs = np.where(blob_sel)
             m_area = area_px
         m_pts = np.column_stack([mxs, mys]).astype(np.int32)
 
@@ -181,8 +158,6 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
         feret_mm = feret_px * mm_per_px if calibrated else None
         area_mm2 = m_area * (mm_per_px ** 2) if calibrated else None
 
-        # THE SPEC RULE: ignore particles whose longest span is under the
-        # threshold. For a round particle that span is its diameter.
         if calibrated and feret_mm < p["min_length_mm"]:
             continue
 
@@ -227,7 +202,6 @@ def inspect(frame, rois, params=None):
     res = Result()
     res.calibrated = float(p["mm_per_px"]) > 0
 
-    # scale annotation weight with resolution so marks stay visible on 20MP
     h, w = annotated.shape[:2]
     th = max(1, int(round(max(h, w) / 1600)))
     fs = max(0.4, min(1.4, max(h, w) / 3600.0))
