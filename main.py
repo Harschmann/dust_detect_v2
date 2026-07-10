@@ -26,10 +26,10 @@ from datetime import datetime
 
 import cv2
 import customtkinter as ctk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 from camera import CameraManager, enumerate_cameras
-from detector import inspect, DEFAULT_PARAMS, mm_per_px_from_roi, px_for_length
+from detector import inspect, DEFAULT_PARAMS, mm_per_px_from_roi, px_for_length, white_mask_preview
 from storage import Storage
 from canvas_widget import ViewState, ImageCanvas
 
@@ -78,6 +78,9 @@ class App(ctk.CTk):
         self.review = None              # (original, result, saved, model)
         self.calib_mode = False         # True while picking two points for calibration
         self.calib_pts = []             # full-res points picked for the 2-point measure
+        self.static_image = None        # loaded-from-disk frame; overrides live feed when set
+        self.static_name = ""
+        self.show_mask = False          # live mask-preview toggle
 
         self.current_model = ctk.StringVar(value="")
         self.sigma = ctk.DoubleVar(value=DEFAULT_PARAMS["sigma"])
@@ -85,6 +88,7 @@ class App(ctk.CTk):
         self.mm_per_px = ctk.DoubleVar(value=DEFAULT_PARAMS["mm_per_px"])
         self.white_only = ctk.BooleanVar(value=DEFAULT_PARAMS["white_only"])
         self.white_sat = ctk.IntVar(value=DEFAULT_PARAMS["white_max_saturation"])
+        self.dark_floor = ctk.IntVar(value=DEFAULT_PARAMS["dark_floor"])
         self.blur_ksize = ctk.IntVar(value=DEFAULT_PARAMS["blur_ksize"])
         self.min_pixels = ctk.IntVar(value=DEFAULT_PARAMS["min_pixels"])
 
@@ -105,6 +109,7 @@ class App(ctk.CTk):
             "mm_per_px": float(self.mm_per_px.get()),
             "white_only": bool(self.white_only.get()),
             "white_max_saturation": int(self.white_sat.get()),
+            "dark_floor": int(self.dark_floor.get()),
             "blur_ksize": int(self.blur_ksize.get()),
             "min_pixels": int(self.min_pixels.get()),
         }
@@ -115,6 +120,7 @@ class App(ctk.CTk):
         self.mm_per_px.set(p.get("mm_per_px", DEFAULT_PARAMS["mm_per_px"]))
         self.white_only.set(bool(p.get("white_only", DEFAULT_PARAMS["white_only"])))
         self.white_sat.set(int(p.get("white_max_saturation", DEFAULT_PARAMS["white_max_saturation"])))
+        self.dark_floor.set(int(p.get("dark_floor", DEFAULT_PARAMS["dark_floor"])))
         self.blur_ksize.set(int(p.get("blur_ksize", DEFAULT_PARAMS["blur_ksize"])))
         self.min_pixels.set(int(p.get("min_pixels", DEFAULT_PARAMS["min_pixels"])))
         self._update_calib_chip()
@@ -147,6 +153,17 @@ class App(ctk.CTk):
                                          button_color=ACCENT_DIM, border_color=LINE,
                                          text_color=TEXT, dropdown_fg_color=PANEL)
         self.cam_combo.pack(side="right", padx=4)
+
+        # source: live camera vs an opened image
+        src = ctk.CTkFrame(top, fg_color="transparent")
+        src.pack(side="right", padx=(0, 6))
+        ctk.CTkButton(src, text="\U0001F4C1 Open Image", width=118, height=30, fg_color=PANEL2,
+                      hover_color=LINE, text_color=TEXT,
+                      command=self._open_image_file).pack(side="left", padx=3)
+        self.live_btn = ctk.CTkButton(src, text="\u25CB Live", width=70, height=30, fg_color=PANEL2,
+                                      hover_color=LINE, text_color=MUTED,
+                                      command=self._use_live_feed)
+        self.live_btn.pack(side="left", padx=3)
 
         # ---------- centre: swaps between live and review
         self.center = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -210,10 +227,26 @@ class App(ctk.CTk):
                            ("+", lambda: self._zoom(1.2), 32)):
             ctk.CTkButton(bar, text=txt, width=w, height=26, fg_color=PANEL,
                           hover_color=LINE, text_color=TEXT, command=fn).pack(side="left", padx=3)
+        self.mask_btn = ctk.CTkButton(bar, text="\u25D1 Mask view", width=104, height=26,
+                                      fg_color=PANEL, hover_color=LINE, text_color=MUTED,
+                                      command=self._toggle_mask)
+        self.mask_btn.pack(side="left", padx=(10, 3))
         self.hint = ctk.CTkLabel(bar, text="click = ROI   drag = pan   scroll = zoom   "
                                            "shift+scroll = radius   del = remove   space = inspect",
                                  text_color=MUTED, font=ctk.CTkFont(size=10))
         self.hint.pack(side="left", padx=12)
+
+        # calibration strip (hidden unless picking two points)
+        self.calib_bar = ctk.CTkFrame(self.center, fg_color="#10251a", corner_radius=6)
+        self.calib_status = ctk.CTkLabel(self.calib_bar, text="", text_color=ACCENT,
+                                         font=ctk.CTkFont(size=11, weight="bold"))
+        self.calib_status.pack(side="left", padx=(12, 8), pady=5)
+        ctk.CTkButton(self.calib_bar, text="\u21B6 Undo point", width=100, height=26,
+                      fg_color=PANEL2, hover_color=LINE, text_color=TEXT,
+                      command=self._undo_two_point).pack(side="left", padx=3, pady=5)
+        ctk.CTkButton(self.calib_bar, text="\u2715 Cancel", width=84, height=26,
+                      fg_color="#3a1418", hover_color="#5c2027", text_color=TEXT,
+                      command=self._cancel_two_point).pack(side="left", padx=3, pady=5)
 
         # ---------- sidebar
         side = ctk.CTkFrame(self, width=316, fg_color=PANEL, corner_radius=0)
@@ -339,6 +372,47 @@ class App(ctk.CTk):
         self._log(f"connecting: {label}")
         threading.Thread(target=lambda: self.camera.connect(desc), daemon=True).start()
 
+    # ---------------------------------------------------------- image source
+    def frame_source(self):
+        """The frame the whole app works on: a loaded image if one is open,
+        otherwise the live camera. ROIs, calibration, capture all use this."""
+        if self.static_image is not None:
+            return self.static_image
+        return self.camera.get_frame()
+
+    def _open_image_file(self):
+        path = filedialog.askopenfilename(
+            title="Open an already-captured image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")])
+        if not path:
+            return
+        img = cv2.imread(path)
+        if img is None:
+            messagebox.showerror("Load failed", f"Ye file image ki tarah nahi khuli:\n{path}")
+            return
+        import os as _os
+        self.static_image = img
+        self.static_name = _os.path.basename(path)
+        self._autoset_done = False          # re-evaluate noise floor for this image's size
+        self.calib_pts = []                 # any half-done calibration is now stale
+        self.calib_mode = False
+        self.live_btn.configure(text_color=TEXT)
+        self._back_to_live()
+        self.canvas.source_image = None     # force a fresh fit to the new image
+        self._log(f"opened image: {self.static_name}  ({img.shape[1]}x{img.shape[0]})")
+
+    def _use_live_feed(self):
+        if self.static_image is None:
+            return
+        self.static_image = None
+        self.static_name = ""
+        self.calib_pts = []
+        self.calib_mode = False
+        self.live_btn.configure(text_color=MUTED)
+        self.canvas.source_image = None
+        self._back_to_live()
+        self._log("switched back to live feed")
+
     # ============================================================= models
     def _refresh_models(self):
         self.model_combo.configure(values=self.storage.list_models())
@@ -398,8 +472,7 @@ class App(ctk.CTk):
                 self._log(f"2-point measure: {dist_px:.1f} px")
                 if self._settings_win is not None and self._settings_win.winfo_exists():
                     self._settings_win.two_points_done(dist_px)
-                self.hint.configure(text="click = ROI   drag = pan   scroll = zoom   "
-                                         "shift+scroll = radius   del = remove   space = inspect")
+            self._update_calib_bar()
             return
 
         hit = self._hit(cx, cy)
@@ -411,13 +484,53 @@ class App(ctk.CTk):
             self.selected_idx = len(self.rois) - 1
         self._rebuild_roi_list()
 
+    def _show_calib_bar(self):
+        self.calib_bar.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+        self._update_calib_bar()
+
+    def _hide_calib_bar(self):
+        self.calib_bar.grid_forget()
+
+    def _update_calib_bar(self):
+        n = len(self.calib_pts)
+        if n == 0:
+            self.calib_status.configure(text="CALIBRATION  \u2022  click point 1 of 2")
+        elif n == 1:
+            self.calib_status.configure(text="CALIBRATION  \u2022  click point 2 of 2")
+        else:
+            (x1, y1), (x2, y2) = self.calib_pts[0], self.calib_pts[1]
+            d = ((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5
+            self.calib_status.configure(text=f"CALIBRATION  \u2022  {d:.1f} px measured  "
+                                             f"\u2192 enter mm in Settings")
+
     def start_two_point(self):
         self.calib_mode = True
         self.calib_pts = []
         self._back_to_live()
-        self.hint.configure(text="CALIBRATION: click two points a known distance apart "
-                                 "(e.g. across a part you can measure)")
-        self._log("2-point measure: click two points on the image")
+        self._show_calib_bar()
+        self.hint.configure(text="CALIBRATION: click the two ends of a known length   "
+                                 "\u2022   use the buttons above to undo / cancel")
+        self._log("2-point measure: click two points (Undo / Cancel available)")
+
+    def _cancel_two_point(self):
+        self.calib_mode = False
+        self.calib_pts = []
+        self._hide_calib_bar()
+        self.hint.configure(text="click = ROI   drag = pan   scroll = zoom   "
+                                 "shift+scroll = radius   del = remove   space = inspect")
+        self._log("calibration cancelled")
+        if self._settings_win is not None and self._settings_win.winfo_exists():
+            self._settings_win.two_pt_lbl.configure(text="cancelled", text_color=MUTED)
+            self._settings_win.lift()
+
+    def _undo_two_point(self):
+        if self.calib_pts:
+            self.calib_pts.pop()
+            self._log(f"undo point ({len(self.calib_pts)} left)")
+        if not self.calib_mode:                 # re-enter picking if a full pair was undone
+            self.calib_mode = True
+            self._show_calib_bar()
+        self._update_calib_bar()
 
     def _hit(self, cx, cy, tol=14):
         best, bd = None, tol
@@ -500,6 +613,11 @@ class App(ctk.CTk):
         c = self._active_canvas()
         self._active_view().zoom_at(c.winfo_width() / 2, c.winfo_height() / 2, f)
 
+    def _toggle_mask(self):
+        self.show_mask = not self.show_mask
+        self.mask_btn.configure(text_color=(ACCENT if self.show_mask else MUTED))
+        self._log("mask view " + ("on - coloured/dark pixels blacked out" if self.show_mask else "off"))
+
     def _fit(self):
         self._active_canvas().fit_to_window()
 
@@ -518,7 +636,7 @@ class App(ctk.CTk):
         if not self.rois:
             messagebox.showwarning("No ROI", "Kam se kam ek ROI lagao (live view pe click karke).")
             return
-        frame = self.camera.get_frame()          # FULL resolution
+        frame = self.frame_source()          # FULL resolution
         if frame is None:
             messagebox.showwarning("No frame", "Camera se frame nahi mila.")
             return
@@ -653,18 +771,27 @@ class App(ctk.CTk):
             cams, self._pending_cams = self._pending_cams, None
             self._populate_cameras(cams)
 
-        frame = self.camera.get_frame()
+        frame = self.frame_source()
         if frame is not None:
             h, w = frame.shape[:2]
             self._frame_hw = (h, w)
             self._autoset(h, w)
-            self.status.configure(text=self.camera.status_text())
+            if self.static_image is not None:
+                self.status.configure(text=f"\U0001F5BC {self.static_name}   {w}x{h}")
+            else:
+                self.status.configure(text=self.camera.status_text())
 
             if self.mode == "live":
                 scale = min(1.0, MAX_PREVIEW / max(h, w))
                 self._disp_scale = scale
-                disp = (cv2.resize(frame, (max(int(w * scale), 1), max(int(h * scale), 1)),
-                                   interpolation=cv2.INTER_LINEAR) if scale < 1.0 else frame.copy())
+                src = frame
+                if self.show_mask and self.rois:
+                    try:
+                        src = white_mask_preview(frame, self.rois, self.params())
+                    except Exception:
+                        src = frame
+                disp = (cv2.resize(src, (max(int(w * scale), 1), max(int(h * scale), 1)),
+                                   interpolation=cv2.INTER_LINEAR) if scale < 1.0 else src.copy())
                 for i, r in enumerate(self.rois):
                     color = ROI_SEL if i == self.selected_idx else ROI_COLOR
                     c = (int(r["cx"] * scale), int(r["cy"] * scale))
@@ -842,6 +969,8 @@ class SettingsWindow(ctk.CTkToplevel):
                      app.sigma, 2.0, 6.0, lambda v: f"{v:.1f}")
         self._slider(wrap, "White strictness   lower = only pure white",
                      app.white_sat, 20, 180, lambda v: str(int(v)))
+        self._slider(wrap, "Dark floor   gray below this is masked out (0 = off)",
+                     app.dark_floor, 0, 150, lambda v: str(int(v)))
         self._slider(wrap, "Noise floor (px)   used when uncalibrated",
                      app.min_pixels, 1, 400, lambda v: str(int(v)))
         sw = ctk.CTkFrame(wrap, fg_color="transparent")
@@ -997,12 +1126,16 @@ class SettingsWindow(ctk.CTkToplevel):
         self.app.mm_per_px.set(mmpp)
         self.app.min_pixels.set(DEFAULT_PARAMS["min_pixels"])   # mm rule takes over
         self.app.calib_pts = []
+        self.app.calib_mode = False
+        self.app._hide_calib_bar()
         self.app._log(f"calibrated ({how}): {mmpp * 1000:.3f} um/px")
         self._refresh_calib_out()
 
     def _clear_calib(self):
         self.app.mm_per_px.set(0.0)
         self.app.calib_pts = []
+        self.app.calib_mode = False
+        self.app._hide_calib_bar()
         self.app._log("calibration cleared - pixel mode")
         self._refresh_calib_out()
 
