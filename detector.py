@@ -54,6 +54,7 @@ DEFAULT_PARAMS = dict(
     min_pixels=10,            # hard noise floor, always applied (uncalibrated mode only - see note)
     size_bias_px=0.0,         # subtracted from every measured span; see note below
     max_defect_fraction=0.5,  # reject any blob spanning more than this fraction of the ROI diameter (structural, not a defect)
+    reject_rings=True,        # reject any blob shaped like a ring/donut (has a hole) - the coating's concentric ring, not a defect
 )
 
 # MEASUREMENT ACCURACY
@@ -170,18 +171,37 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     if pix.size < 50:
         return []
 
-    # Statistics over the FULL ROI population, never gated by colour -
-    # a previous version computed mean/std only over "white-eligible"
-    # pixels, which could collapse to almost nothing on a real coating
-    # with broad colour variation and silently return zero detections.
-    # Keeping this simple and ungated is what makes it robust.
-    mean = float(np.mean(pix))
-    std = float(np.std(pix))
+    # LOCAL background detrend: a broad, slowly-varying feature (the
+    # coating's concentric ring) can cover a big chunk of the ROI and
+    # badly skews any GLOBAL mean/std for the whole ROI - a bright ring
+    # covering even ~30-50% of the area drags the mean/std up so much
+    # that real dust stops looking statistically anomalous at all. Local
+    # detrending sidesteps this: subtract each pixel's own neighbourhood
+    # average first. The ring varies slowly in space, so its local mean
+    # tracks it closely and its residual stays near zero everywhere,
+    # however much of the ROI it covers. A small dust speck is much
+    # smaller than the window, so the local average right around it is
+    # still background, and it shows up as a sharp local spike.
+    win = max(31, int(round(radius * 0.5)))
+    if win % 2 == 0:
+        win += 1
+    mask_f = inside.astype(np.float32)
+    num = cv2.boxFilter(gray_c.astype(np.float32) * mask_f, -1, (win, win), normalize=False)
+    den = cv2.boxFilter(mask_f, -1, (win, win), normalize=False)
+    local_mean = num / np.maximum(den, 1e-6)
+    detrended = gray_c.astype(np.float32) - local_mean
+
+    dvals = detrended[inside]
+    med = float(np.median(dvals))
+    mad = float(np.median(np.abs(dvals - med)))
+    std = 1.4826 * mad
+    if std < 1.0:
+        std = max(float(np.std(dvals)), 1.0)
     if std < 1e-6:
         return []
 
-    z = (gray_c.astype(np.float32) - mean) / std
-    bright = (z > p["sigma"]) & inside              # one-sided: brighter than surroundings
+    z = (detrended - med) / std
+    bright = (z > p["sigma"]) & inside              # one-sided: brighter than local surroundings
 
     # White-only: a real defect (dust/thread/glue) is white/gray = LOW
     # saturation. A plain per-pixel cutoff - no growing, no reconstruction,
@@ -198,12 +218,32 @@ def _detect_in_roi(gray, gray_raw, sat, cx, cy, radius, p):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bright_u8 = cv2.morphologyEx(bright_u8, cv2.MORPH_CLOSE, k)
 
+    # RING REJECTION: a ring/donut shape (the coating's concentric ring)
+    # has a HOLE in it - topologically an annulus. A real dust particle
+    # is a solid blob with no hole. Detect this directly from contour
+    # hierarchy and blank out any component that has one, regardless of
+    # its color or brightness. This does not depend on white_only at all.
+    if p.get("reject_rings", True):
+        contours, hierarchy = cv2.findContours(bright_u8, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hierarchy is not None and len(contours) > 0:
+            hierarchy = hierarchy[0]
+            for i, cnt in enumerate(contours):
+                if hierarchy[i][2] != -1:      # has a child contour = has a hole
+                    cv2.drawContours(bright_u8, [cnt], -1, 0, -1)
+
     # Sizing mask, measured on the UNBLURRED image (blur inflates small
-    # particles by ~2px).
-    raw_mean = float(np.mean(gray_raw_c[inside]))
-    raw_std = float(np.std(gray_raw_c[inside]))
+    # particles by ~2px). Same local-detrend logic as detection.
+    num_raw = cv2.boxFilter(gray_raw_c.astype(np.float32) * mask_f, -1, (win, win), normalize=False)
+    local_mean_raw = num_raw / np.maximum(den, 1e-6)
+    detrended_raw = gray_raw_c.astype(np.float32) - local_mean_raw
+    raw_vals = detrended_raw[inside]
+    raw_med = float(np.median(raw_vals))
+    raw_mad = float(np.median(np.abs(raw_vals - raw_med)))
+    raw_std = 1.4826 * raw_mad
+    if raw_std < 1.0:
+        raw_std = max(float(np.std(raw_vals)), 1.0)
     if raw_std > 1e-6:
-        z_raw = (gray_raw_c.astype(np.float32) - raw_mean) / raw_std
+        z_raw = (detrended_raw - raw_med) / raw_std
         sharp = (z_raw > p["sigma"]) & inside
         if p["white_only"] and sat_c is not None:
             sharp &= (sat_c <= p["white_max_saturation"])
