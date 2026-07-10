@@ -1,7 +1,6 @@
 """
 camera.py
 ----------
-ok 
 Enumerates every camera the machine can see and lets the app connect to
 a chosen one:
 
